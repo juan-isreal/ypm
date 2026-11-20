@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+import os
+import sys
+import json
+import shlex
+import shutil
+import subprocess
+
+# Core directories
+BASE_DIR = os.path.expanduser("~/.ypm")
+BIN_DIR = os.path.join(BASE_DIR, "bin")
+PKG_DIR = os.path.join(BASE_DIR, "packages")
+TMP_DIR = os.path.join(BASE_DIR, "tmp")
+DB_FILE = os.path.join(BASE_DIR, "installed.json")
+
+
+def bash(cmd, check=True, capture=False):
+    """Run a bash command cleanly from Python."""
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        executable="/bin/bash",
+        text=True,
+        capture_output=capture,
+        check=check
+    )
+    return result.stdout.strip() if capture else result.returncode
+
+
+def init_env():
+    """Ensure ~/.ypm folders and registry database exist."""
+    for folder in (BASE_DIR, BIN_DIR, PKG_DIR, TMP_DIR):
+        os.makedirs(folder, exist_ok=True)
+    if not os.path.exists(DB_FILE):
+        save_db({})
+
+
+def load_db():
+    with open(DB_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_db(data):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def setup_shell():
+    """Add ~/.ypm/bin to PATH and ~/.ypm/packages to PYTHONPATH."""
+    shell_rc = os.path.expanduser("~/.zshrc" if "zsh" in os.environ.get("SHELL", "") else "~/.bashrc")
+    export_lines = (
+        '\n# Added by ypm package manager\n'
+        'export PATH="$HOME/.ypm/bin:$PATH"\n'
+        'export PYTHONPATH="$HOME/.ypm/packages:$PYTHONPATH"\n'
+    )
+
+    existing = ""
+    if os.path.exists(shell_rc):
+        with open(shell_rc, "r", encoding="utf-8") as f:
+            existing = f.read()
+
+    if "$HOME/.ypm/bin" in existing:
+        print(f"Already set up in {shell_rc}!")
+        return
+
+    with open(shell_rc, "a", encoding="utf-8") as f:
+        f.write(export_lines)
+
+    print(f"Added ypm paths to {shell_rc}!")
+    print(f"Run this once to activate now:  source {shell_rc}")
+
+
+def install_package(target):
+    """Install a package from GitHub (format: username/repo)."""
+    if "/" not in target:
+        print("Error: Use GitHub format 'username/repo' (e.g., ypm install juan-isreal/json)")
+        sys.exit(1)
+
+    owner, repo = target.split("/", 1)
+    pkg_name = repo.lower()
+    zip_path = os.path.join(TMP_DIR, f"{pkg_name}.zip")
+    extract_dir = os.path.join(TMP_DIR, f"{pkg_name}_src")
+
+    bash(f"rm -rf {shlex.quote(zip_path)} {shlex.quote(extract_dir)}")
+    os.makedirs(extract_dir, exist_ok=True)
+
+    downloaded = False
+    for branch in ("main", "master"):
+        url = f"https://github.com{owner}/{repo}/archive/refs/heads/{branch}.zip"
+        print(f"Downloading {target} ({branch})...")
+        status = bash(f"curl -fLs {shlex.quote(url)} -o {shlex.quote(zip_path)}", check=False)
+        if status == 0 and os.path.exists(zip_path) and os.path.getsize(zip_path) > 0:
+            downloaded = True
+            break
+
+    if not downloaded:
+        print(f"Failed to download '{target}'. Check that the repo exists and is public.")
+        sys.exit(1)
+
+    bash(f"unzip -qo {shlex.quote(zip_path)} -d {shlex.quote(extract_dir)}")
+
+    subfolders = [f.path for f in os.scandir(extract_dir) if f.is_dir()]
+    if not subfolders:
+        print("Error: Archive was empty.")
+        sys.exit(1)
+    repo_root = subfolders
+
+    manifest_path = os.path.join(repo_root, "ypm.json")
+    manifest = {}
+    if os.path.exists(manifest_path):
+        print("Found ypm.json manifest!")
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+    pkg_name = manifest.get("name", pkg_name).lower()
+    pkg_type = manifest.get("type")
+    entry_file = manifest.get("entry")
+    version = manifest.get("version", "latest")
+
+    if not pkg_type:
+        no_ext_files = [
+            f.name for f in os.scandir(repo_root)
+            if f.is_file() and "." not in f.name and f.name.lower() not in ("license", "readme", "makefile")
+        ]
+        py_files = [
+            f.name for f in os.scandir(repo_root)
+            if f.is_file() and f.name.endswith(".py") and f.name != "setup.py"
+        ]
+
+        if no_ext_files:
+            pkg_type = "cli"
+            entry_file = no_ext_files
+        elif os.path.exists(os.path.join(repo_root, f"{pkg_name}.py")):
+            pkg_type = "lib"
+            entry_file = f"{pkg_name}.py"
+        elif os.path.exists(os.path.join(repo_root, "__init__.py")):
+            pkg_type = "lib"
+            entry_file = "__init__.py"
+        elif len(py_files) == 1:
+            pkg_type = "lib"
+            entry_file = py_files
+        else:
+            pkg_type = "lib"
+
+    installed_paths = []
+
+    if pkg_type == "cli":
+        src_file = os.path.join(repo_root, entry_file)
+        dest_bin = os.path.join(BIN_DIR, pkg_name)
+        shutil.copy2(src_file, dest_bin)
+        bash(f"chmod +x {shlex.quote(dest_bin)}")
+        installed_paths.append(dest_bin)
+        print(f"Installed CLI command '{pkg_name}' -> {dest_bin}")
+
+    elif pkg_type == "lib":
+        if entry_file and entry_file != "__init__.py" and os.path.isfile(os.path.join(repo_root, entry_file)):
+            dest_file = os.path.join(PKG_DIR, entry_file)
+            shutil.copy2(os.path.join(repo_root, entry_file), dest_file)
+            installed_paths.append(dest_file)
+        else:
+            dest_pkg = os.path.join(PKG_DIR, pkg_name)
+            if os.path.exists(dest_pkg):
+                shutil.rmtree(dest_pkg)
+            shutil.copytree(repo_root, dest_pkg)
+            installed_paths.append(dest_pkg)
+        print(f"Installed Python library '{pkg_name}' -> {PKG_DIR}")
+
+    if "post_install" in manifest:
+        print("Running post-install hook...")
+        bash(f"cd {shlex.quote(repo_root)} && {manifest['post_install']}")
+
+    db = load_db()
+    db[pkg_name] = {
+        "repo": target,
+        "type": pkg_type,
+        "version": version,
+        "paths": installed_paths
+    }
+    save_db(db)
+
+    bash(f"rm -rf {shlex.quote(zip_path)} {shlex.quote(extract_dir)}")
+    print(f"Done! '{pkg_name}' is ready to use.")
+
+
+def get_file(target):
+    """Download a single file from a GitHub repo into the current directory (pwd)."""
+    parts = target.split("/", 2)
+    if len(parts) < 3 or not parts:
+        print("Error: Use format 'username/repo/path/to/file'")
+        sys.exit(1)
+
+    owner, repo, file_path = parts
+    filename = os.path.basename(file_path)
+    dest_path = os.path.join(os.getcwd(), filename)
+
+    downloaded = False
+    for branch in ("main", "master"):
+        raw_url = f"https://githubusercontent.com{owner}/{repo}/refs/heads/{branch}/{file_path}"
+        print(f"Fetching {file_path} from {owner}/{repo} ({branch})...")
+        status = bash(f"curl -fLs {shlex.quote(raw_url)} -o {shlex.quote(dest_path)}", check=False)
+        if status == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+            downloaded = True
+            break
+
+    if not downloaded:
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+        print(f"Failed to fetch '{file_path}'. Check the repo and file path.")
+        sys.exit(1)
+
+    print(f"Saved '{filename}' -> {dest_path}")
+
+
+def remove_package(pkg_name):
+    pkg_name = pkg_name.lower()
+    db = load_db()
+    if pkg_name not in db:
+        print(f"Package '{pkg_name}' is not installed.")
+        sys.exit(1)
+
+    for path in db[pkg_name].get("paths", []):
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.exists(path):
+            os.remove(path)
+
+    del db[pkg_name]
+    save_db(db)
+    print(f"Removed '{pkg_name}'.")
+
+
+def list_packages():
+    db = load_db()
+    if not db:
+        print("No packages installed yet.")
+        return
+    print(f"{'PACKAGE':<18} {'TYPE':<8} {'SOURCE'}")
+    print("-" * 45)
+    for name, info in db.items():
+        print(f"{name:<18} {info['type']:<8} {info['repo']}")
+
+
+def print_help():
+    print("""ypm - Pure Python Package Manager
+
+Usage:
+  ypm setup                        Add ~/.ypm to PATH and PYTHONPATH
+  ypm install <user/repo>          Install a CLI tool or Python library globally
+  ypm get <user/repo/path/file>    Download a single file into your current folder
+  ypm remove <package>             Uninstall a global package
+  ypm list                         Show installed packages
+""")
+
+
+if __name__ == "__main__":
+    init_env()
+
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print_help()
+        sys.exit(0)
+
+    command = sys.argv[1]
+
+    if command == "setup":
+        setup_shell()
+    elif command == "install":
+        if len(sys.argv) < 3:
+            print("Usage: ypm install <username/repo>")
+            sys.exit(1)
+        install_package(sys.argv[2])
+    elif command == "get":
+        if len(sys.argv) < 3:
+            print("Usage: ypm get <username/repo/path/to/file>")
+            sys.exit(1)
+        get_file(sys.argv[2])
+    elif command in ("remove", "uninstall"):
+        if len(sys.argv) < 3:
+            print("Usage: ypm remove <package_name>")
+            sys.exit(1)
+        remove_package(sys.argv[2])
+    elif command == "list":
+        list_packages()
+    else:
+        print(f"Unknown command: '{command}'")
+        print_help()
+        sys.exit(1)
