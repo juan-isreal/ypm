@@ -20,7 +20,7 @@ if [ -f "./ypm" ]; then
     sudo cp ./ypm "$INSTALL_PATH"
 else
     echo "Downloading ypm from GitHub..."
-    RAW_URL="https://raw.githubusercontent.com/{REPO_USER}/${REPO_NAME}/refs/heads/${BRANCH}/ypm"
+    RAW_URL="https://raw.githubusercontent.com/${REPO_USER}/${REPO_NAME}/refs/heads/${BRANCH}/ypm"
     sudo curl -fsSL "$RAW_URL" -o "$INSTALL_PATH"
 fi
 
